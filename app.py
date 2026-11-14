@@ -16,7 +16,8 @@ UPSTREAM = (
 REFERER = "https://tvnow.st/"
 
 ALLOWED_HOSTS = {
-    "cache0.wonvt.st"
+    "cache0.wonvt.st",
+    "silver-harbor-27.lifeisaware.workers.dev"
 }
 
 session = requests.Session()
