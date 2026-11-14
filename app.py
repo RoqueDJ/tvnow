@@ -8,12 +8,17 @@ from urllib.parse import urlparse, urljoin, quote, unquote
 
 app = Flask(__name__)
 
-UPSTREAM = (
-    "https://cache0.wonvt.st/live/"
-    "1ewxgzu023dos60vlh62k/master.m3u8"
-)
-
 REFERER = "https://tvnow.st/"
+
+CHANNELS = {
+    "nickelodeon": "https://cache0.wonvt.st/live/1ewxgzu023dos60vlh62k/master.m3u8",
+    "disney-channel": "https://cache0.wonvt.st/live/0i3hubv0wk47dd1l1o550/master.m3u8",
+    "disney-junior": "https://cache0.wonvt.st/live/12axgb204j4al111stg8p/master.m3u8",
+    "disney-xd": "https://cache0.wonvt.st/live/0sw6uxy1c6ro7z0wmk5ex/master.m3u8",
+    "cartoon-network": "https://cache0.wonvt.st/live/162nn8p18ljgc71v5dou4/master.m3u8",
+    "nicktoons": "https://cache0.wonvt.st/live/06dd65k13kqj0919p35h0/master.m3u8",
+    "nick-jr": "https://cache0.wonvt.st/live/1bex0aj18f1l6i1q5egjg/master.m3u8",
+}
 
 ALLOWED_HOSTS = {
     "cache0.wonvt.st",
@@ -46,21 +51,18 @@ def local_proxy_url(url):
 
 
 def rewrite_playlist(content, base_url):
-
     lines = content.splitlines()
     output = []
 
     for line in lines:
-
         line = line.strip()
 
         if not line:
             output.append(line)
             continue
 
-        # Rewrite URI attributes (keys, maps, etc.)
         def replace_uri(match):
-            original = match.group(2)
+            original = match.group(1)
 
             if original.startswith(("data:", "skd:")):
                 return match.group(0)
@@ -71,11 +73,10 @@ def rewrite_playlist(content, base_url):
 
         line = re.sub(
             r'URI="([^"]+)"',
-            lambda m: replace_uri(m),
+            replace_uri,
             line
         )
 
-        # Rewrite playlist and segment URLs
         if not line.startswith("#"):
             absolute = urljoin(base_url, line)
             line = local_proxy_url(absolute)
@@ -90,15 +91,31 @@ def home():
     return "RoqueDJ HLS Proxy Online"
 
 
-@app.route("/live.m3u8")
-def live():
+@app.route("/channels")
+def channels():
+    return {
+        "ok": True,
+        "count": len(CHANNELS),
+        "channels": [
+            {
+                "name": name,
+                "url": f"/{name}.m3u8"
+            }
+            for name in CHANNELS
+        ]
+    }
 
-    return proxy_response(UPSTREAM)
+
+@app.route("/<channel>.m3u8")
+def live(channel):
+    if channel not in CHANNELS:
+        abort(404)
+
+    return proxy_response(CHANNELS[channel])
 
 
 @app.route("/proxy")
 def proxy():
-
     url = request.args.get("url")
 
     if not url:
@@ -108,7 +125,6 @@ def proxy():
 
 
 def proxy_response(url):
-
     validate_url(url)
 
     headers = {}
@@ -128,10 +144,7 @@ def proxy_response(url):
         validate_url(upstream.url)
 
         if upstream.status_code >= 400:
-            return Response(
-                "Upstream error",
-                status=502
-            )
+            return Response("Upstream error", status=502)
 
         content_type = upstream.headers.get(
             "Content-Type", ""
@@ -141,7 +154,6 @@ def proxy_response(url):
             "mpegurl" in content_type.lower()
             or upstream.text.lstrip().startswith("#EXTM3U")
         ):
-
             result = rewrite_playlist(
                 upstream.text,
                 upstream.url
@@ -151,9 +163,7 @@ def proxy_response(url):
                 result,
                 content_type="application/vnd.apple.mpegurl"
             )
-
         else:
-
             response = Response(
                 upstream.content,
                 status=upstream.status_code,
@@ -177,5 +187,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000))
-)
-  
+    )
+    
