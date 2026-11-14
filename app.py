@@ -18,6 +18,7 @@ CHANNELS = {
     "cartoon-network": "https://cache0.wonvt.st/live/162nn8p18ljgc71v5dou4/master.m3u8",
     "nicktoons": "https://cache0.wonvt.st/live/06dd65k13kqj0919p35h0/master.m3u8",
     "nick-jr": "https://cache0.wonvt.st/live/1bex0aj18f1l6i1q5egjg/master.m3u8",
+    "comedy-central": "https://cache0.wonvt.st/live/14rw4rg1p40gaj1jl7u0v/master.m3u8"
 }
 
 ALLOWED_HOSTS = {
