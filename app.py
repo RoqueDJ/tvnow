@@ -6,10 +6,12 @@ import requests
 from threading import local
 from flask import Flask, Response, request, abort
 from urllib.parse import urlparse, urljoin, quote
+from waitress import serve
 
 app = Flask(__name__)
 
 REFERER = "https://tvnow.st/"
+USER_AGENT = "Mozilla/5.0"
 
 CHANNELS = {
     "nickelodeon": "https://cache0.wonvt.st/live/1ewxgzu023dos60vlh62k/master.m3u8",
@@ -29,7 +31,8 @@ ALLOWED_HOSTS = {
 
 MAX_REDIRECTS = 5
 MAX_PLAYLIST_SIZE = 2 * 1024 * 1024
-CHUNK_SIZE = 64 * 1024
+CHUNK_SIZE = 32 * 1024
+TIMEOUT = (8, 30)
 
 thread_local = local()
 
@@ -37,14 +40,18 @@ thread_local = local()
 def get_session():
     if not hasattr(thread_local, "session"):
         session = requests.Session()
-
         session.headers.update({
             "Referer": REFERER,
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": USER_AGENT,
             "Accept": "*/*",
             "Accept-Encoding": "identity"
         })
-
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+            max_retries=0
+        )
+        session.mount("https://", adapter)
         thread_local.session = session
 
     return thread_local.session
@@ -56,22 +63,20 @@ def validate_url(url):
 
     parsed = urlparse(url)
 
-    if parsed.scheme != "https":
-        abort(403)
-
-    if parsed.hostname not in ALLOWED_HOSTS:
-        abort(403)
-
-    if parsed.username or parsed.password:
-        abort(403)
-
-    if parsed.port not in (None, 443):
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in ALLOWED_HOSTS
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 443)
+    ):
         abort(403)
 
     return url
 
 
 def local_proxy_url(url):
+    validate_url(url)
     return "/proxy?url=" + quote(url, safe="")
 
 
@@ -82,42 +87,176 @@ def rewrite_playlist(content, base_url):
         line = line.strip()
 
         if not line:
-            output.append(line)
+            output.append("")
             continue
 
-        def replace_uri(match):
-            original = match.group(2)
+        if line.startswith("#"):
+            def replace_uri(match):
+                original = match.group(2)
 
-            if original.startswith(("data:", "skd:")):
-                return match.group(0)
+                if original.startswith(("data:", "skd:")):
+                    return match.group(0)
 
-            absolute = urljoin(base_url, original)
+                absolute = urljoin(base_url, original)
 
-            return (
-                "URI=" + match.group(1)
-                + local_proxy_url(absolute)
-                + match.group(1)
+                return (
+                    "URI=" + match.group(1)
+                    + local_proxy_url(absolute)
+                    + match.group(1)
+                )
+
+            line = re.sub(
+                r"""URI=(["'])(.*?)\1""",
+                replace_uri,
+                line,
+                flags=re.IGNORECASE
             )
-
-        line = re.sub(
-            r"""URI=(["'])(.*?)\1""",
-            replace_uri,
-            line
-        )
-
-        if not line.startswith("#"):
-            line = local_proxy_url(
-                urljoin(base_url, line)
+            output.append(line)
+        else:
+            output.append(
+                local_proxy_url(urljoin(base_url, line))
             )
-
-        output.append(line)
 
     return "\n".join(output) + "\n"
 
 
+def fetch_upstream(url, headers):
+    session = get_session()
+
+    for attempt in range(MAX_REDIRECTS + 1):
+        validate_url(url)
+
+        upstream = session.get(
+            url,
+            headers=headers,
+            timeout=TIMEOUT,
+            stream=True,
+            allow_redirects=False
+        )
+
+        if upstream.status_code not in (301, 302, 303, 307, 308):
+            return upstream
+
+        location = upstream.headers.get("Location")
+        upstream.close()
+
+        if not location or attempt == MAX_REDIRECTS:
+            return None
+
+        url = urljoin(url, location)
+
+    return None
+
+
+def proxy_response(url):
+    validate_url(url)
+
+    headers = {}
+
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+
+    upstream = None
+
+    try:
+        upstream = fetch_upstream(url, headers)
+
+        if upstream is None:
+            return Response("Upstream unavailable", status=502)
+
+        if upstream.status_code not in (200, 206, 416):
+            upstream.close()
+            return Response("Upstream error", status=502)
+
+        content_type = upstream.headers.get("Content-Type", "")
+
+        iterator = upstream.iter_content(CHUNK_SIZE)
+        first_chunk = next(iterator, b"")
+
+        is_playlist = (
+            "mpegurl" in content_type.lower()
+            or upstream.url.lower().split("?")[0].endswith(".m3u8")
+            or first_chunk.lstrip().startswith(b"#EXTM3U")
+        )
+
+        response_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store"
+        }
+
+        if is_playlist:
+            try:
+                chunks = [first_chunk]
+                total_size = len(first_chunk)
+
+                for chunk in iterator:
+                    total_size += len(chunk)
+
+                    if total_size > MAX_PLAYLIST_SIZE:
+                        return Response("Playlist too large", status=502)
+
+                    chunks.append(chunk)
+
+                content = b"".join(chunks).decode(
+                    "utf-8-sig",
+                    errors="replace"
+                )
+
+                result = rewrite_playlist(content, upstream.url)
+
+                return Response(
+                    result,
+                    status=200,
+                    content_type="application/vnd.apple.mpegurl",
+                    headers=response_headers
+                )
+
+            finally:
+                upstream.close()
+
+        for header in (
+            "Content-Length",
+            "Content-Range",
+            "Accept-Ranges",
+            "ETag",
+            "Last-Modified"
+        ):
+            value = upstream.headers.get(header)
+            if value:
+                response_headers[header] = value
+
+        def generate():
+            try:
+                if first_chunk:
+                    yield first_chunk
+
+                for chunk in iterator:
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            generate(),
+            status=upstream.status_code,
+            headers=response_headers,
+            content_type=content_type or "application/octet-stream",
+            direct_passthrough=True
+        )
+
+    except requests.RequestException:
+        if upstream is not None:
+            upstream.close()
+
+        return Response("Upstream connection failed", status=502)
+
+
 @app.route("/")
 def home():
-    return "These are m3u8 links controlled by @RoqueDJ in GitHub. Do not upload to iptv-org, as they sre being tested. Thank you."
+    return (
+        "These are m3u8 links controlled by @RoqueDJ in GitHub. "
+        "Do not upload to iptv-org, as they are being tested. Thank you."
+    )
 
 
 @app.route("/health")
@@ -135,10 +274,7 @@ def channels():
         "ok": True,
         "count": len(CHANNELS),
         "channels": [
-            {
-                "name": name,
-                "url": f"/{name}.m3u8"
-            }
+            {"name": name, "url": f"/{name}.m3u8"}
             for name in CHANNELS
         ]
     }
@@ -162,164 +298,12 @@ def proxy():
     return proxy_response(url)
 
 
-def fetch_upstream(url, headers):
-    session = get_session()
-
-    for attempt in range(MAX_REDIRECTS + 1):
-        validate_url(url)
-
-        upstream = session.get(
-            url,
-            headers=headers,
-            timeout=(8, 20),
-            stream=True,
-            allow_redirects=False
-        )
-
-        if upstream.status_code not in (
-            301, 302, 303, 307, 308
-        ):
-            return upstream
-
-        location = upstream.headers.get("Location")
-        upstream.close()
-
-        if not location or attempt == MAX_REDIRECTS:
-            return None
-
-        url = urljoin(url, location)
-
-    return None
-
-
-def proxy_response(url):
-    validate_url(url)
-
-    headers = {}
-
-    if request.headers.get("Range"):
-        headers["Range"] = request.headers["Range"]
-
-    try:
-        upstream = fetch_upstream(url, headers)
-
-        if upstream is None:
-            return Response(
-                "Too many redirects or missing location",
-                status=502
-            )
-
-        if upstream.status_code not in (200, 206, 416):
-            upstream.close()
-
-            return Response(
-                "Upstream returned an error",
-                status=502
-            )
-
-        content_type = upstream.headers.get(
-            "Content-Type", ""
-        )
-
-        iterator = upstream.iter_content(
-            chunk_size=CHUNK_SIZE
-        )
-
-        first_chunk = next(iterator, b"")
-
-        is_playlist = (
-            "mpegurl" in content_type.lower()
-            or upstream.url.lower().split("?")[0].endswith(".m3u8")
-            or first_chunk.lstrip().startswith(b"#EXTM3U")
-        )
-
-        if is_playlist:
-            try:
-                chunks = [first_chunk]
-                total_size = len(first_chunk)
-
-                for chunk in iterator:
-                    total_size += len(chunk)
-
-                    if total_size > MAX_PLAYLIST_SIZE:
-                        upstream.close()
-
-                        return Response(
-                            "Playlist too large",
-                            status=502
-                        )
-
-                    chunks.append(chunk)
-
-                content = b"".join(chunks).decode(
-                    "utf-8-sig",
-                    errors="replace"
-                )
-
-                result = rewrite_playlist(
-                    content,
-                    upstream.url
-                )
-
-                response = Response(
-                    result,
-                    status=upstream.status_code,
-                    content_type="application/vnd.apple.mpegurl"
-                )
-
-            finally:
-                upstream.close()
-
-        else:
-            response_headers = {}
-
-            for header in (
-                "Content-Length",
-                "Content-Range",
-                "Accept-Ranges",
-                "ETag",
-                "Last-Modified"
-            ):
-                value = upstream.headers.get(header)
-
-                if value:
-                    response_headers[header] = value
-
-            def generate():
-                try:
-                    if first_chunk:
-                        yield first_chunk
-
-                    for chunk in iterator:
-                        yield chunk
-
-                finally:
-                    upstream.close()
-
-            response = Response(
-                generate(),
-                status=upstream.status_code,
-                headers=response_headers,
-                content_type=content_type or
-                "application/octet-stream",
-                direct_passthrough=True
-            )
-
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Cache-Control"] = "no-store"
-
-        return response
-
-    except requests.RequestException:
-        return Response(
-            "Upstream connection failed",
-            status=502
-        )
-
-
 if __name__ == "__main__":
-    app.run(
+    serve(
+        app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
+        port=int(os.environ.get("PORT", 5000)),
+        threads=4,
+        connection_limit=20
     )
     
